@@ -96,6 +96,27 @@ func formatLimitToBytes(queue string) string {
 	return fmt.Sprintf("%s000000/%s000000", parts[0], parts[1])
 }
 
+// Supaya pencarian jadi super cepat tanpa request berulang-ulang
+func getAllQueuesMap(client *routeros.Client) map[string]string {
+	queueMap := make(map[string]string)
+
+	// Ambil semua simple queue
+	reply, err := client.Run("/queue/simple/print")
+	if err != nil {
+		return queueMap
+	}
+
+	for _, re := range reply.Re {
+		target := re.Map["target"] // misal: 192.168.1.1/32
+		limit := re.Map["max-limit"]
+
+		// Bersihkan target dari subnet mask /32 jika ada, untuk memudahkan pencocokan
+		// Tapi queue mikrotik biasanya formatnya "192.168.1.1/32"
+		queueMap[target] = formatSpeed(limit)
+	}
+	return queueMap
+}
+
 // --- FUNGSI UTAMA ---
 
 func (m *Manager) GetIdentity(routerID int) string {
@@ -118,24 +139,29 @@ func (m *Manager) GetIdentity(routerID int) string {
 	return "Unknown"
 }
 
-// 1. CARI PENGGUNA (Login Router 1 -> Cek -> Close -> Login Router 2 -> Cek -> Close)
+// 1. CARI PENGGUNA (VERSI CEPAT)
 func (m *Manager) CariPengguna(nama string) string {
 	var results []string
 	routerIDs := []int{1, 2}
 
 	for _, rid := range routerIDs {
-		// Konek
 		client, rName, err := m.connectToRouter(rid)
 		if err != nil {
-			continue // Skip router ini jika mati
+			continue
 		}
 
-		// Ambil data Binding
+		// 1. Ambil Semua Queue DULUAN (Bulk Fetch)
+		// Ini rahasia kecepatannya. Kita download semua data queue sekali saja.
+		queueData := getAllQueuesMap(client)
+
+		// 2. Ambil Semua Binding
 		reply, err := client.Run("/ip/hotspot/ip-binding/print")
+
 		if err == nil {
 			for _, re := range reply.Re {
 				comment := re.Map["comment"]
-				// Filter manual logic
+
+				// Filter Nama (Case Insensitive)
 				if strings.Contains(strings.ToLower(comment), strings.ToLower(nama)) {
 					address := re.Map["address"]
 					status := "Aktif"
@@ -143,11 +169,11 @@ func (m *Manager) CariPengguna(nama string) string {
 						status = "Isolir"
 					}
 
-					// Cek Queue (Masih dalam satu koneksi yang sama)
-					limitStr := "tidak ada"
-					qReply, errQ := client.Run("/queue/simple/print", "?target="+address+"/32")
-					if errQ == nil && len(qReply.Re) > 0 {
-						limitStr = formatSpeed(qReply.Re[0].Map["max-limit"])
+					// 3. Cek Queue dari MEMORI (Tidak perlu request ke Mikrotik lagi)
+					// Kita cari apakah ada queue untuk "IP + /32"
+					limitStr, exists := queueData[address+"/32"]
+					if !exists {
+						limitStr = "tidak ada"
 					}
 
 					msg := fmt.Sprintf("*Lokasi*: %s\n*comment*: %s\n*address*: %s\n*status*: %s\n*max limit*: %s\n",
@@ -156,18 +182,20 @@ func (m *Manager) CariPengguna(nama string) string {
 				}
 			}
 		}
-
-		// Tutup koneksi router ini sebelum lanjut ke router berikutnya
 		client.Close()
 	}
 
 	if len(results) == 0 {
 		return fmt.Sprintf("Tidak ditemukan pengguna dengan nama '%s'", nama)
 	}
+	// Batasi output jika terlalu panjang agar WA tidak error
+	if len(results) > 1000 {
+		return fmt.Sprintf("Ditemukan %d data. Mohon persempit pencarian (terlalu banyak).", len(results))
+	}
 	return strings.Join(results, "\n")
 }
 
-// 2. CARI ALAMAT IP
+// 2. CARI ALAMAT IP (VERSI CEPAT)
 func (m *Manager) CariAlamatIP(ip string) string {
 	routerIDs := []int{1, 2}
 
@@ -177,10 +205,9 @@ func (m *Manager) CariAlamatIP(ip string) string {
 			continue
 		}
 
-		// Cek Binding
+		// Cek Binding Langsung (Filter by IP di server Mikrotik lebih cepat)
 		reply, err := client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
 
-		// Jika ketemu
 		if err == nil && len(reply.Re) > 0 {
 			item := reply.Re[0].Map
 			status := "Aktif"
@@ -188,19 +215,19 @@ func (m *Manager) CariAlamatIP(ip string) string {
 				status = "Isolir"
 			}
 
-			// Cek Queue
+			// Cek Queue spesifik (Karena cuma 1 IP, kita request langsung gapapa)
 			limitStr := "tidak ada"
 			qReply, errQ := client.Run("/queue/simple/print", "?target="+ip+"/32")
 			if errQ == nil && len(qReply.Re) > 0 {
 				limitStr = formatSpeed(qReply.Re[0].Map["max-limit"])
 			}
 
-			client.Close() // Tutup
+			client.Close()
 			return fmt.Sprintf("*Sumber*: %s\n*comment*: %s\n*address*: %s\n*status*: %s\n*max limit*: %s",
 				rName, item["comment"], ip, status, limitStr)
 		}
 
-		client.Close() // Tutup dan lanjut router sebelah
+		client.Close()
 	}
 
 	return fmt.Sprintf("IP %s tidak ditemukan di Router 1 maupun Router 2.", ip)
