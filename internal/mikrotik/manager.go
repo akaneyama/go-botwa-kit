@@ -3,8 +3,8 @@ package mikrotik
 import (
 	"crypto/tls"
 	"fmt"
+	"strconv"
 	"strings"
-	"sync"
 
 	"whatsappbot/internal/config"
 
@@ -12,89 +12,102 @@ import (
 )
 
 type Manager struct {
-	Client1 *routeros.Client
-	Mu1     sync.Mutex // Kunci pengaman untuk Router 1
-
-	Client2 *routeros.Client
-	Mu2     sync.Mutex // Kunci pengaman untuk Router 2
-}
-
-// Helper: Koneksi SSL
-func connectSSL(host, user, pass string) (*routeros.Client, error) {
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-	}
-	// Pastikan host di config memiliki port, misal 192.168.88.1:8729
-	return routeros.DialTLS(host, user, pass, tlsConfig)
+	Config *config.Config
 }
 
 func NewManager(cfg *config.Config) *Manager {
-	mgr := &Manager{}
-
-	c1, err := connectSSL(cfg.Router1.Host, cfg.Router1.User, cfg.Router1.Pass)
-	if err != nil {
-		fmt.Printf("⚠️ Gagal konek ke MikroTik 1 (SSL): %v\n", err)
-	} else {
-		mgr.Client1 = c1
-		fmt.Println("✅ Terhubung ke MikroTik 1 via SSL")
+	return &Manager{
+		Config: cfg,
 	}
-
-	c2, err := connectSSL(cfg.Router2.Host, cfg.Router2.User, cfg.Router2.Pass)
-	if err != nil {
-		fmt.Printf("⚠️ Gagal konek ke MikroTik 2 (SSL): %v\n", err)
-	} else {
-		mgr.Client2 = c2
-		fmt.Println("✅ Terhubung ke MikroTik 2 via SSL")
-	}
-
-	return mgr
 }
 
-// --- HELPER FUNGSI ---
+// --- HELPER KONEKSI (ON-THE-FLY) ---
 
-// Logika: 193.168 -> Router 2, Sisanya -> Router 1
-// Mengembalikan: Client, Mutex, Nama Router, Error
-func (m *Manager) getTargetRouter(ip string) (*routeros.Client, *sync.Mutex, string, error) {
-	// Aturan Router 2 (Kampoeng Putih)
+// Fungsi ini membuat koneksi BARU setiap kali dipanggil, lalu mengembalikan clientnya.
+// Jangan lupa di-close setelah dipakai!
+func (m *Manager) connectToRouter(routerID int) (*routeros.Client, string, error) {
+	var host, user, pass, name string
+
+	if routerID == 1 {
+		host = m.Config.Router1.Host
+		user = m.Config.Router1.User
+		pass = m.Config.Router1.Pass
+		name = "Kampoeng IT"
+	} else {
+		host = m.Config.Router2.Host
+		user = m.Config.Router2.User
+		pass = m.Config.Router2.Pass
+		name = "Kampoeng Putih"
+	}
+
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+
+	// DialTLS ke Router
+	client, err := routeros.DialTLS(host, user, pass, tlsConfig)
+	if err != nil {
+		return nil, name, fmt.Errorf("gagal konek ke %s: %v", name, err)
+	}
+
+	return client, name, nil
+}
+
+// Menentukan ID Router berdasarkan IP
+func (m *Manager) determineRouterID(ip string) (int, error) {
 	if strings.HasPrefix(ip, "193.168") {
-		if m.Client2 == nil {
-			return nil, nil, "", fmt.Errorf("❌ Koneksi ke Router 2 (Kampoeng Putih) terputus")
-		}
-		return m.Client2, &m.Mu2, "Kampoeng Putih", nil
+		return 2, nil // Router 2
 	}
-
-	// Aturan Router 1 (Kampoeng IT) - Default
 	if strings.HasPrefix(ip, "192.168") || strings.HasPrefix(ip, "123.123") || strings.HasPrefix(ip, "172.16") {
-		if m.Client1 == nil {
-			return nil, nil, "", fmt.Errorf("❌ Koneksi ke Router 1 (Kampoeng IT) terputus")
-		}
-		return m.Client1, &m.Mu1, "Kampoeng IT", nil
+		return 1, nil // Router 1
 	}
+	return 0, fmt.Errorf("IP %s tidak dikenali", ip)
+}
 
-	return nil, nil, "", fmt.Errorf("❌ IP %s tidak dikenali (cek prefix IP)", ip)
+// --- HELPER FORMATTING ---
+
+func formatSpeed(limitStr string) string {
+	if limitStr == "" {
+		return "tidak ada"
+	}
+	parts := strings.Split(limitStr, "/")
+	if len(parts) != 2 {
+		return limitStr
+	}
+	convert := func(valStr string) string {
+		val, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil {
+			return "N/A"
+		}
+		if val >= 1000000 {
+			return fmt.Sprintf("%d Mbps", val/1000000)
+		}
+		if val >= 1000 {
+			return fmt.Sprintf("%d Kbps", val/1000)
+		}
+		return fmt.Sprintf("%d bps", val)
+	}
+	return fmt.Sprintf("%s / %s", convert(parts[0]), convert(parts[1]))
+}
+
+func formatLimitToBytes(queue string) string {
+	parts := strings.Split(queue, "/")
+	if len(parts) != 2 {
+		return queue
+	}
+	return fmt.Sprintf("%s000000/%s000000", parts[0], parts[1])
 }
 
 // --- FUNGSI UTAMA ---
 
 func (m *Manager) GetIdentity(routerID int) string {
-	var client *routeros.Client
-	var mu *sync.Mutex
-
-	if routerID == 1 {
-		client = m.Client1
-		mu = &m.Mu1
-	} else {
-		client = m.Client2
-		mu = &m.Mu2
+	// 1. Konek
+	client, _, err := m.connectToRouter(routerID)
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
 	}
+	// 2. Wajib Close saat selesai
+	defer client.Close()
 
-	if client == nil {
-		return "❌ Koneksi Putus"
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
+	// 3. Eksekusi
 	reply, err := client.Run("/system/identity/print")
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
@@ -105,64 +118,47 @@ func (m *Manager) GetIdentity(routerID int) string {
 	return "Unknown"
 }
 
-// 1. CARI PENGGUNA (Search All Routers)
+// 1. CARI PENGGUNA (Login Router 1 -> Cek -> Close -> Login Router 2 -> Cek -> Close)
 func (m *Manager) CariPengguna(nama string) string {
 	var results []string
+	routerIDs := []int{1, 2}
 
-	targets := []struct {
-		Client *routeros.Client
-		Mu     *sync.Mutex
-		Name   string
-	}{
-		{m.Client1, &m.Mu1, "Kampoeng IT"},
-		{m.Client2, &m.Mu2, "Kampoeng Putih"},
-	}
-
-	for _, t := range targets {
-		if t.Client == nil {
-			continue
+	for _, rid := range routerIDs {
+		// Konek
+		client, rName, err := m.connectToRouter(rid)
+		if err != nil {
+			continue // Skip router ini jika mati
 		}
 
-		// KUNCI PINTU
-		t.Mu.Lock()
-
-		reply, err := t.Client.Run("/ip/hotspot/ip-binding/print")
-
-		// Simpan data ke variabel lokal
-		var foundItems []map[string]string
+		// Ambil data Binding
+		reply, err := client.Run("/ip/hotspot/ip-binding/print")
 		if err == nil {
 			for _, re := range reply.Re {
-				if strings.Contains(strings.ToLower(re.Map["comment"]), strings.ToLower(nama)) {
-					foundItems = append(foundItems, re.Map)
+				comment := re.Map["comment"]
+				// Filter manual logic
+				if strings.Contains(strings.ToLower(comment), strings.ToLower(nama)) {
+					address := re.Map["address"]
+					status := "Aktif"
+					if re.Map["disabled"] == "true" {
+						status = "Isolir"
+					}
+
+					// Cek Queue (Masih dalam satu koneksi yang sama)
+					limitStr := "tidak ada"
+					qReply, errQ := client.Run("/queue/simple/print", "?target="+address+"/32")
+					if errQ == nil && len(qReply.Re) > 0 {
+						limitStr = formatSpeed(qReply.Re[0].Map["max-limit"])
+					}
+
+					msg := fmt.Sprintf("*Lokasi*: %s\n*comment*: %s\n*address*: %s\n*status*: %s\n*max limit*: %s\n",
+						rName, comment, address, status, limitStr)
+					results = append(results, msg)
 				}
 			}
 		}
 
-		// Proses item yang ditemukan
-		for _, item := range foundItems {
-			comment := item["comment"]
-			address := item["address"]
-			disabled := item["disabled"]
-			status := "Aktif"
-			if disabled == "true" {
-				status = "Isolir"
-			}
-
-			limitStr := "tidak ada"
-			qReply, errQ := t.Client.Run("/queue/simple/print", "?target="+address+"/32")
-
-			if errQ == nil && qReply != nil && len(qReply.Re) > 0 {
-				rawLimit := qReply.Re[0].Map["max-limit"]
-				limitStr = formatSpeed(rawLimit)
-			}
-
-			msg := fmt.Sprintf("*Lokasi*: %s\n*comment*: %s\n*address*: %s\n*status*: %s\n*max limit*: %s\n",
-				t.Name, comment, address, status, limitStr)
-			results = append(results, msg)
-		}
-
-		// BUKA KUNCI
-		t.Mu.Unlock()
+		// Tutup koneksi router ini sebelum lanjut ke router berikutnya
+		client.Close()
 	}
 
 	if len(results) == 0 {
@@ -171,242 +167,207 @@ func (m *Manager) CariPengguna(nama string) string {
 	return strings.Join(results, "\n")
 }
 
-// 2. CARI ALAMAT IP (Search All Routers)
+// 2. CARI ALAMAT IP
 func (m *Manager) CariAlamatIP(ip string) string {
-	targets := []struct {
-		Client *routeros.Client
-		Mu     *sync.Mutex
-		Name   string
-	}{
-		{m.Client1, &m.Mu1, "Kampoeng IT"},
-		{m.Client2, &m.Mu2, "Kampoeng Putih"},
-	}
+	routerIDs := []int{1, 2}
 
-	for _, t := range targets {
-		if t.Client == nil {
+	for _, rid := range routerIDs {
+		client, rName, err := m.connectToRouter(rid)
+		if err != nil {
 			continue
 		}
 
-		// KUNCI PINTU
-		t.Mu.Lock()
+		// Cek Binding
+		reply, err := client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
 
-		reply, err := t.Client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
+		// Jika ketemu
+		if err == nil && len(reply.Re) > 0 {
+			item := reply.Re[0].Map
+			status := "Aktif"
+			if item["disabled"] == "true" {
+				status = "Isolir"
+			}
 
-		// Jika error atau kosong, buka kunci dan lanjut ke router sebelah
-		if err != nil || reply == nil || len(reply.Re) == 0 {
-			t.Mu.Unlock()
-			continue
+			// Cek Queue
+			limitStr := "tidak ada"
+			qReply, errQ := client.Run("/queue/simple/print", "?target="+ip+"/32")
+			if errQ == nil && len(qReply.Re) > 0 {
+				limitStr = formatSpeed(qReply.Re[0].Map["max-limit"])
+			}
+
+			client.Close() // Tutup
+			return fmt.Sprintf("*Sumber*: %s\n*comment*: %s\n*address*: %s\n*status*: %s\n*max limit*: %s",
+				rName, item["comment"], ip, status, limitStr)
 		}
 
-		item := reply.Re[0].Map
-		status := "Aktif"
-		if item["disabled"] == "true" {
-			status = "Isolir"
-		}
-
-		limitStr := "tidak ada"
-		qReply, errQ := t.Client.Run("/queue/simple/print", "?target="+ip+"/32")
-
-		if errQ == nil && qReply != nil && len(qReply.Re) > 0 {
-			limitStr = formatSpeed(qReply.Re[0].Map["max-limit"])
-		}
-
-		// BUKA KUNCI
-		t.Mu.Unlock()
-
-		return fmt.Sprintf("*Sumber*: %s\n*comment*: %s\n*address*: %s\n*status*: %s\n*max limit*: %s",
-			t.Name, item["comment"], ip, status, limitStr)
+		client.Close() // Tutup dan lanjut router sebelah
 	}
 
 	return fmt.Sprintf("IP %s tidak ditemukan di Router 1 maupun Router 2.", ip)
 }
 
-// 3. UBAH STATUS (HIDUPKAN/MATIKAN)
+// 3. UBAH STATUS
 func (m *Manager) UbahStatusIP(ip string, command string) string {
-	// 1. Tentukan Router dan Kunci
-	client, mu, routerName, err := m.getTargetRouter(ip)
+	rid, err := m.determineRouterID(ip)
 	if err != nil {
 		return err.Error()
 	}
 
-	// KUNCI PINTU
-	mu.Lock()
-	defer mu.Unlock()
+	// Konek Spesifik
+	client, rName, err := m.connectToRouter(rid)
+	if err != nil {
+		return err.Error()
+	}
+	defer client.Close()
 
-	// 2. Cari ID
+	// Cari ID
 	reply, err := client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
-	if err != nil || reply == nil || len(reply.Re) == 0 {
-		return fmt.Sprintf("IP %s tidak ditemukan di %s.", ip, routerName)
+	if err != nil || len(reply.Re) == 0 {
+		return fmt.Sprintf("IP %s tidak ditemukan di %s.", ip, rName)
 	}
 
 	id := reply.Re[0].Map[".id"]
 	comment := reply.Re[0].Map["comment"]
-	currentDisabled := reply.Re[0].Map["disabled"]
+	currDisabled := reply.Re[0].Map["disabled"]
 
-	// 3. Logika Matikan/Hidupkan
-	targetDisabled := "no"
+	target := "no"
 	if command == "matikan" {
-		targetDisabled = "yes"
+		target = "yes"
 	}
 
-	if command == "matikan" && currentDisabled == "true" {
-		return fmt.Sprintf("*Lokasi*: %s\n*User*: %s\n*Status*: Sudah Isolir", routerName, comment)
+	if command == "matikan" && currDisabled == "true" {
+		return fmt.Sprintf("*Lokasi*: %s\n*User*: %s\n*Status*: Sudah Isolir", rName, comment)
 	}
-	if command == "hidupkan" && currentDisabled == "false" {
-		return fmt.Sprintf("*Lokasi*: %s\n*User*: %s\n*Status*: Sudah Hidup", routerName, comment)
+	if command == "hidupkan" && currDisabled == "false" {
+		return fmt.Sprintf("*Lokasi*: %s\n*User*: %s\n*Status*: Sudah Hidup", rName, comment)
 	}
 
-	// 4. Eksekusi
-	_, err = client.Run("/ip/hotspot/ip-binding/set", "=.id="+id, "=disabled="+targetDisabled)
+	// Eksekusi
+	_, err = client.Run("/ip/hotspot/ip-binding/set", "=.id="+id, "=disabled="+target)
 	if err != nil {
-		return fmt.Sprintf("Gagal mengubah status di %s: %v", routerName, err)
+		return fmt.Sprintf("Gagal ubah status: %v", err)
 	}
 
-	statusMsg := "berhasil di-hidupkan"
+	msg := "berhasil di-hidupkan"
 	if command == "matikan" {
-		statusMsg = "berhasil di-disable"
+		msg = "berhasil di-disable"
 	}
-
-	return fmt.Sprintf("*Lokasi*: %s\n*User*: %s\n*Status*: %s", routerName, comment, statusMsg)
+	return fmt.Sprintf("*Lokasi*: %s\n*User*: %s\n*Status*: %s", rName, comment, msg)
 }
 
-// 4. TAMBAH / EDIT CLIENT (BINDING & QUEUE)
+// 4. TAMBAH / EDIT CLIENT
 func (m *Manager) EditAtauTambahClient(ip, limit, nama string) string {
-	// 1. Tentukan Router dan Kunci
-	client, mu, routerName, err := m.getTargetRouter(ip)
+	rid, err := m.determineRouterID(ip)
 	if err != nil {
 		return err.Error()
 	}
 
 	limitBytes := formatLimitToBytes(limit)
 
-	// KUNCI PINTU
-	mu.Lock()
-	// Kita akan unlock manual sebelum return CariAlamatIP
+	// Konek
+	client, rName, err := m.connectToRouter(rid)
+	if err != nil {
+		return err.Error()
+	}
+	// Kita jangan defer Close disini, karena di akhir kita panggil CariAlamatIP (yang akan connect lagi)
+	// Jadi kita close manual sebelum return.
 
-	// A. BINDING
+	// A. Binding
 	reply, _ := client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
-
-	if reply == nil || len(reply.Re) == 0 {
-		// Tambah Baru
-		_, err = client.Run("/ip/hotspot/ip-binding/add",
-			"=address="+ip,
-			"=type=bypassed",
-			"=disabled=no",
-			"=comment="+nama,
-		)
+	if len(reply.Re) == 0 {
+		_, err = client.Run("/ip/hotspot/ip-binding/add", "=address="+ip, "=type=bypassed", "=disabled=no", "=comment="+nama)
 	} else {
-		// Edit Existing
 		id := reply.Re[0].Map[".id"]
 		_, err = client.Run("/ip/hotspot/ip-binding/set", "=.id="+id, "=comment="+nama)
 	}
-
 	if err != nil {
-		mu.Unlock() // Unlock jika error
-		return fmt.Sprintf("Gagal proses binding di %s: %v", routerName, err)
+		client.Close()
+		return fmt.Sprintf("Gagal proses binding di %s: %v", rName, err)
 	}
 
-	// B. QUEUE
+	// B. Queue
 	qReply, _ := client.Run("/queue/simple/print", "?target="+ip+"/32")
-
-	if qReply == nil || len(qReply.Re) == 0 {
-		// Tambah Queue
-		_, err = client.Run("/queue/simple/add",
-			"=name="+nama,
-			"=target="+ip+"/32",
-			"=max-limit="+limitBytes,
-			"=comment="+nama+" - nd",
-		)
+	if len(qReply.Re) == 0 {
+		_, err = client.Run("/queue/simple/add", "=name="+nama, "=target="+ip+"/32", "=max-limit="+limitBytes, "=comment="+nama+" - nd")
 	} else {
-		// Edit Queue
-		qID := qReply.Re[0].Map[".id"]
-		_, err = client.Run("/queue/simple/set",
-			"=.id="+qID,
-			"=name="+nama,
-			"=max-limit="+limitBytes,
-			"=comment="+nama+" - nd",
-		)
+		id := qReply.Re[0].Map[".id"]
+		_, err = client.Run("/queue/simple/set", "=.id="+id, "=name="+nama, "=max-limit="+limitBytes, "=comment="+nama+" - nd")
 	}
 
 	if err != nil {
-		mu.Unlock() // Unlock jika error
-		return fmt.Sprintf("Binding sukses di %s, tapi Queue gagal: %v", routerName, err)
+		client.Close()
+		return fmt.Sprintf("Binding sukses, tapi Queue gagal: %v", err)
 	}
 
-	// BUKA KUNCI SEBELUM PANGGIL FUNGSI LAIN
-	mu.Unlock()
+	// Tutup koneksi SEBELUM memanggil CariAlamatIP
+	client.Close()
 
-	// Return cari alamat IP (Fungsi ini aman dipanggil karena sudah di-unlock)
+	// Panggil fungsi CariAlamatIP (Fungsi ini akan membuka koneksi baru lagi)
 	return m.CariAlamatIP(ip)
 }
 
 // 5. PUTUS CLIENT
 func (m *Manager) PutusClient(ip string) string {
-	client, mu, routerName, err := m.getTargetRouter(ip)
+	rid, err := m.determineRouterID(ip)
 	if err != nil {
 		return err.Error()
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	client, rName, err := m.connectToRouter(rid)
+	if err != nil {
+		return err.Error()
+	}
+	defer client.Close()
 
-	bReply, _ := client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
-	if bReply != nil && len(bReply.Re) > 0 {
-		id := bReply.Re[0].Map[".id"]
+	// Hapus Binding
+	reply, _ := client.Run("/ip/hotspot/ip-binding/print", "?address="+ip)
+	if len(reply.Re) > 0 {
+		id := reply.Re[0].Map[".id"]
 		client.Run("/ip/hotspot/ip-binding/remove", "=.id="+id)
 	} else {
-		return fmt.Sprintf("IP tidak ditemukan di binding %s.", routerName)
+		return fmt.Sprintf("IP %s tidak ada di binding %s", ip, rName)
 	}
 
+	// Hapus Queue
 	qReply, _ := client.Run("/queue/simple/print", "?target="+ip+"/32")
-	if qReply != nil && len(qReply.Re) > 0 {
+	if len(qReply.Re) > 0 {
 		id := qReply.Re[0].Map[".id"]
 		client.Run("/queue/simple/remove", "=.id="+id)
 	}
 
-	return fmt.Sprintf("Client %s berhasil diputus dari %s.", ip, routerName)
+	return fmt.Sprintf("Client %s berhasil diputus dari %s", ip, rName)
 }
 
 // 6. EDIT LIMIT
 func (m *Manager) EditLimit(ip, limit string) string {
-	// 1. Tentukan Router
-	client, mu, routerName, err := m.getTargetRouter(ip)
+	rid, err := m.determineRouterID(ip)
 	if err != nil {
 		return err.Error()
 	}
 
 	limitBytes := formatLimitToBytes(limit)
 
-	// KUNCI PINTU
-	mu.Lock()
-	// Manual unlock sebelum return CariAlamatIP
+	client, rName, err := m.connectToRouter(rid)
+	if err != nil {
+		return err.Error()
+	}
 
-	// Cari Queue
+	// Cek Queue
 	qReply, err := client.Run("/queue/simple/print", "?target="+ip+"/32")
-
-	if err != nil || qReply == nil || len(qReply.Re) == 0 {
-		mu.Unlock()
-		return fmt.Sprintf("IP %s belum dilimit atau tidak ditemukan di %s.", ip, routerName)
+	if err != nil || len(qReply.Re) == 0 {
+		client.Close()
+		return fmt.Sprintf("IP %s belum dilimit di %s", ip, rName)
 	}
 
 	id := qReply.Re[0].Map[".id"]
 	name := qReply.Re[0].Map["name"]
 
-	// Eksekusi Update
-	_, err = client.Run("/queue/simple/set",
-		"=.id="+id,
-		"=name="+name,
-		"=max-limit="+limitBytes,
-	)
-
+	_, err = client.Run("/queue/simple/set", "=.id="+id, "=name="+name, "=max-limit="+limitBytes)
 	if err != nil {
-		mu.Unlock()
-		return fmt.Sprintf("Gagal edit limit di %s: %v", routerName, err)
+		client.Close()
+		return fmt.Sprintf("Gagal edit limit: %v", err)
 	}
 
-	// BUKA KUNCI
-	mu.Unlock()
-
-	// Return hasil terbaru
+	client.Close() // Tutup sebelum panggil fungsi lain
 	return m.CariAlamatIP(ip)
 }
